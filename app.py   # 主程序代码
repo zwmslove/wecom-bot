@@ -1,0 +1,232 @@
+import json
+import logging
+import hashlib
+import base64
+import struct
+import re
+import os
+from datetime import datetime
+from flask import Flask, request, jsonify
+import requests
+from Crypto.Cipher import AES
+
+# ============================================================
+# 配置区域 - 请务必修改以下参数
+# ============================================================
+
+# 企业微信智能机器人配置（从企微后台获取）
+TOKEN = "你的Token"                      # 替换为实际的Token
+ENCODING_AES_KEY = "你的EncodingAESKey"  # 替换为实际的EncodingAESKey（43位）
+CORP_ID = ""                             # 智能机器人场景传空字符串
+
+# 腾讯文档配置（如果暂时没有，可以先用备选方案）
+TENCENT_DOC_ENABLED = False              # 设为True启用腾讯文档，False则使用本地日志
+TENCENT_DOC_ACCESS_TOKEN = ""            # 腾讯文档API的access_token
+TENCENT_DOC_SHEET_ID = ""               # 腾讯文档的sheet_id
+
+# 快递群配置
+DELIVERY_GROUP_CHATID = ""               # 快递群的chatid（后续获取后填写）
+
+# 日志配置
+logging.basicConfig(level=logging.INFO)
+
+
+# ============================================================
+# 企业微信加解密工具类
+# ============================================================
+
+class WXBizMsgCrypt:
+    def __init__(self, token, encoding_aes_key, receive_id):
+        self.token = token
+        self.aes_key = base64.b64decode(encoding_aes_key + "=")
+        self.receive_id = receive_id
+    
+    def verify_url(self, msg_signature, timestamp, nonce, echostr):
+        signature = self._gen_signature(timestamp, nonce, echostr)
+        if signature != msg_signature:
+            raise Exception("签名校验失败")
+        decrypted = self._decrypt(echostr)
+        return decrypted
+    
+    def decrypt_msg(self, msg_signature, timestamp, nonce, encrypt_msg):
+        signature = self._gen_signature(timestamp, nonce, encrypt_msg)
+        if signature != msg_signature:
+            raise Exception("签名校验失败")
+        decrypted = self._decrypt(encrypt_msg)
+        return decrypted
+    
+    def _gen_signature(self, timestamp, nonce, encrypt):
+        sort_list = [self.token, timestamp, nonce, encrypt]
+        sort_list.sort()
+        sha1 = hashlib.sha1("".join(sort_list).encode())
+        return sha1.hexdigest()
+    
+    def _decrypt(self, encrypt_msg):
+        cipher = AES.new(self.aes_key, AES.MODE_CBC, self.aes_key[:16])
+        plain_text = cipher.decrypt(base64.b64decode(encrypt_msg))
+        pad = plain_text[-1]
+        content = plain_text[:-pad]
+        msg_len = struct.unpack(">I", content[16:20])[0]
+        msg = content[20:20+msg_len].decode("utf-8")
+        receive_id = content[20+msg_len:].decode("utf-8")
+        if receive_id != self.receive_id:
+            raise Exception("receive_id校验失败")
+        return msg
+
+
+# ============================================================
+# 业务逻辑模块
+# ============================================================
+
+app = Flask(__name__)
+
+# 初始化加解密工具
+crypt = WXBizMsgCrypt(TOKEN, ENCODING_AES_KEY, CORP_ID)
+
+
+def parse_tracking_numbers(content):
+    """从消息中提取快递单号"""
+    # 先移除@机器人的部分
+    content = re.sub(r'@[^\s]+', '', content)
+    
+    # 移除"拦截"等触发词
+    content = re.sub(r'拦截|退回|拦截退回', '', content)
+    
+    # 支持的分隔符：换行、逗号、顿号、空格、竖线、分号等
+    pattern = r'[，,、\s\n\r\|;；]+'
+    
+    # 按分隔符拆分
+    parts = re.split(pattern, content.strip())
+    
+    # 过滤空字符串，并提取纯数字（快递单号通常是纯数字）
+    numbers = []
+    for p in parts:
+        p = p.strip()
+        # 匹配8-15位纯数字（根据你的快递单号规则调整）
+        if re.match(r'^\d{8,15}$', p):
+            numbers.append(p)
+    
+    # 去重
+    return list(set(numbers))
+
+
+def reply_to_group(chatid, content):
+    """主动向群发送消息"""
+    # 注意：企微发送消息需要用access_token，这里需要额外获取
+    # 由于智能机器人主动发送消息需要access_token，这个功能后续补充
+    logging.info(f"准备向群{chatid}发送回复: {content}")
+    # 实际实现需要调用企微API发送消息
+
+
+def forward_to_delivery_group(tracking_numbers):
+    """转发到快递群"""
+    if not tracking_numbers:
+        return
+    msg = f"【加急拦截】共{len(tracking_numbers)}个单号：\n" + "\n".join(tracking_numbers) + "\n请速处理，谢谢！"
+    logging.info(f"转发到快递群: {msg}")
+    # 实际实现需要调用企微API发送消息
+
+
+def register_to_document(tracking_number, group_name, user_id):
+    """登记到腾讯文档"""
+    if TENCENT_DOC_ENABLED:
+        # 腾讯文档API调用
+        logging.info(f"写入腾讯文档: 单号={tracking_number}, 群={group_name}, 用户={user_id}")
+        # 这里接入腾讯文档API
+    else:
+        # 备选方案：写入本地文件或打印日志
+        log_entry = f"{datetime.now()},{tracking_number},{group_name},{user_id},待拦截\n"
+        with open("intercept_log.csv", "a", encoding="utf-8") as f:
+            f.write(log_entry)
+        logging.info(f"登记成功: {tracking_number}")
+
+
+# ============================================================
+# 路由：URL验证（GET请求）
+# ============================================================
+
+@app.route("/wecom_callback", methods=["GET"])
+def verify_url():
+    msg_signature = request.args.get("msg_signature")
+    timestamp = request.args.get("timestamp")
+    nonce = request.args.get("nonce")
+    echostr = request.args.get("echostr")
+    
+    try:
+        plain_echostr = crypt.verify_url(msg_signature, timestamp, nonce, echostr)
+        return plain_echostr
+    except Exception as e:
+        logging.error(f"URL验证失败: {e}")
+        return "验证失败", 403
+
+
+# ============================================================
+# 路由：接收消息（POST请求）
+# ============================================================
+
+@app.route("/wecom_callback", methods=["POST"])
+def receive_message():
+    msg_signature = request.args.get("msg_signature")
+    timestamp = request.args.get("timestamp")
+    nonce = request.args.get("nonce")
+    
+    body = request.get_json()
+    encrypt_msg = body.get("encrypt")
+    
+    try:
+        plain_msg = crypt.decrypt_msg(msg_signature, timestamp, nonce, encrypt_msg)
+        msg_data = json.loads(plain_msg)
+        
+        # 只处理文本消息
+        if msg_data.get("msgtype") == "text":
+            content = msg_data.get("text", {}).get("content", "")
+            chatid = msg_data.get("chatid", "")
+            from_user = msg_data.get("from", {}).get("userid", "")
+            
+            logging.info(f"收到消息: 群={chatid}, 用户={from_user}, 内容={content}")
+            
+            # 检查是否包含"拦截"关键词
+            if "拦截" in content or "退回" in content:
+                # 解析快递单号
+                numbers = parse_tracking_numbers(content)
+                
+                if numbers:
+                    # 1. 转发到快递群
+                    forward_to_delivery_group(numbers)
+                    
+                    # 2. 登记到文档
+                    group_name = f"群_{chatid[-6:]}"  # 取chatid后6位作为群名
+                    for num in numbers:
+                        register_to_document(num, group_name, from_user)
+                    
+                    # 3. 回复客户
+                    reply_msg = f"✅ 已收到拦截请求，共{len(numbers)}个单号，已通知快递员处理"
+                    reply_to_group(chatid, reply_msg)
+                else:
+                    reply_to_group(chatid, "❌ 未识别到有效的快递单号，请发送格式：@机器人 1234567890 拦截")
+            else:
+                # 不包含关键词，静默忽略
+                logging.info("消息不包含拦截关键词，忽略")
+        
+        return "", 200
+        
+    except Exception as e:
+        logging.error(f"消息处理失败: {e}")
+        return "处理失败", 500
+
+
+# ============================================================
+# 路由：健康检查
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def health():
+    return {"status": "ok", "service": "wecom-bot"}, 200
+
+
+# ============================================================
+# 启动服务
+# ============================================================
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
