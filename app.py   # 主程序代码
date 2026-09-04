@@ -15,8 +15,8 @@ from Crypto.Cipher import AES
 # ============================================================
 
 # 企业微信智能机器人配置（从企微后台获取）
-TOKEN = "你的Token"                      # 替换为实际的Token
-ENCODING_AES_KEY = "你的EncodingAESKey"  # 替换为实际的EncodingAESKey（43位）
+TOKEN = "GrlnoXhmK"                      # 替换为实际的Token
+ENCODING_AES_KEY = "FCWktqYyAgRC6mGIhnL7cKMTISOnD1E02jbgwYU178h"  # 替换为实际的EncodingAESKey（43位）
 CORP_ID = ""                             # 智能机器人场景传空字符串
 
 # 腾讯文档配置（如果暂时没有，可以先用备选方案）
